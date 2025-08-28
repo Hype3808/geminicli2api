@@ -17,11 +17,16 @@ SCOPES = [
     "https://www.googleapis.com/auth/cloud-platform",
     "https://www.googleapis.com/auth/userinfo.email",
     "https://www.googleapis.com/auth/userinfo.profile",
+    "openid",
 ]
 
 # File Paths
-SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CREDENTIAL_FILE = os.path.join(SCRIPT_DIR, os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "oauth_creds.json"))
+
+# Set credential file to be in the 'auth' folder at the project root
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+AUTH_DIR = os.path.join(PROJECT_ROOT, "auth")
+os.makedirs(AUTH_DIR, exist_ok=True)
+CREDENTIAL_FILE = os.path.join(AUTH_DIR, os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "oauth_creds.json"))
 
 # Authentication
 GEMINI_AUTH_PASSWORD = os.getenv("GEMINI_AUTH_PASSWORD", "123456")

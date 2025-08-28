@@ -5,6 +5,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from .gemini_routes import router as gemini_router
 from .openai_routes import router as openai_router
 from .auth import get_credentials, get_user_project_id, onboard_user
+from .dashboard import router as dashboard_router
 
 # Load environment variables from .env file
 try:
@@ -105,33 +106,7 @@ async def handle_preflight(request: Request, full_path: str):
         }
     )
 
-# Root endpoint - no authentication required
-@app.get("/")
-async def root():
-    """
-    Root endpoint providing project information.
-    No authentication required.
-    """
-    return {
-        "name": "geminicli2api",
-        "description": "OpenAI-compatible API proxy for Google's Gemini models via gemini-cli",
-        "purpose": "Provides both OpenAI-compatible endpoints (/v1/chat/completions) and native Gemini API endpoints for accessing Google's Gemini models",
-        "version": "1.0.0",
-        "endpoints": {
-            "openai_compatible": {
-                "chat_completions": "/v1/chat/completions",
-                "models": "/v1/models"
-            },
-            "native_gemini": {
-                "models": "/v1beta/models",
-                "generate": "/v1beta/models/{model}/generateContent",
-                "stream": "/v1beta/models/{model}/streamGenerateContent"
-            },
-            "health": "/health"
-        },
-        "authentication": "Required for all endpoints except root and health",
-        "repository": "https://github.com/user/geminicli2api"
-    }
+# The dashboard at '/' now provides credential status and upload.
 
 # Health check endpoint for Docker/Hugging Face
 @app.get("/health")
@@ -139,5 +114,6 @@ async def health_check():
     """Health check endpoint for container orchestration."""
     return {"status": "healthy", "service": "geminicli2api"}
 
+app.include_router(dashboard_router)
 app.include_router(openai_router)
 app.include_router(gemini_router)

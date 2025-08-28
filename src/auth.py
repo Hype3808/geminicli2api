@@ -3,6 +3,7 @@ import json
 import base64
 import time
 import logging
+import warnings
 from datetime import datetime
 from fastapi import Request, HTTPException, Depends
 from fastapi.security import HTTPBasic
@@ -16,8 +17,105 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from .utils import get_user_agent, get_client_metadata
 from .config import (
     CLIENT_ID, CLIENT_SECRET, SCOPES, CREDENTIAL_FILE,
-    CODE_ASSIST_ENDPOINT, GEMINI_AUTH_PASSWORD
+    CODE_ASSIST_ENDPOINT, GEMINI_AUTH_PASSWORD, AUTH_DIR
 )
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+def authorize_and_save_credentials(project_ids):
+    """
+    Launch OAuth flow ONCE and save the resulting credentials for each project_id in project_ids as {project_id}.json in the 'auth' folder.
+    If the signed-in account does not have access to a project_id, print an error for that project.
+    """
+    try:
+        client_config = {
+            "installed": {
+                "client_id": CLIENT_ID,
+                "client_secret": CLIENT_SECRET,
+                "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                "token_uri": "https://oauth2.googleapis.com/token",
+            }
+        }
+        print("Starting OAuth flow (only once for all projects)...")
+        flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            creds = flow.run_local_server(port=0, prompt='consent')
+        print("OAuth flow completed. Saving credentials for each project...")
+
+        # Get the email of the signed-in user
+        from googleapiclient.discovery import build
+        oauth2_service = build('oauth2', 'v2', credentials=creds)
+        user_info = oauth2_service.userinfo().get().execute()
+        signed_in_email = user_info.get('email')
+        print(f"Signed in as: {signed_in_email}")
+
+        os.makedirs(AUTH_DIR, exist_ok=True)
+        errors = []
+        for project_id in project_ids:
+            # Optionally, check if the user has access to the project
+            try:
+                # Use Cloud Resource Manager API to check project access
+                crm_service = build('cloudresourcemanager', 'v1', credentials=creds)
+                project = crm_service.projects().get(projectId=project_id).execute()
+                # Optionally, check project owner/creator email if available
+                # If you want to restrict to only projects owned by this user, check project['projectNumber'] or labels
+                # For now, just check if the project is accessible
+                creds_data = json.loads(creds.to_json())
+                creds_data["project_id"] = project_id
+                cred_path = os.path.join(AUTH_DIR, f"{project_id}.json")
+                with open(cred_path, "w") as f:
+                    json.dump(creds_data, f, indent=2)
+                print(f"Saved credentials to {cred_path}")
+            except Exception as e:
+                errors.append(f"Project '{project_id}': {e}")
+                print(f"[ERROR] Could not save credentials for project '{project_id}': {e}")
+        if errors:
+            print("\nSome projects could not be authorized:")
+            for err in errors:
+                print(err)
+    except Exception as e:
+        print(f"[ERROR] Failed to complete OAuth or save credentials: {e}")
+        import traceback
+        traceback.print_exc()
+# --- Credential Rotation Helpers ---
+def list_credential_files():
+    """List all .json credential files in the 'auth' folder."""
+    from .config import AUTH_DIR
+    return [
+        os.path.join(AUTH_DIR, f)
+        for f in os.listdir(AUTH_DIR)
+        if f.endswith('.json') and os.path.isfile(os.path.join(AUTH_DIR, f))
+    ]
+
+def load_credentials_from_file(filepath):
+    """Load Google credentials from a specific file path."""
+    from .config import SCOPES
+    try:
+        with open(filepath, 'r') as f:
+            creds_data = json.load(f)
+        # Handle different credential formats
+        if 'access_token' in creds_data and 'token' not in creds_data:
+            creds_data['token'] = creds_data['access_token']
+        if 'scope' in creds_data and 'scopes' not in creds_data:
+            creds_data['scopes'] = creds_data['scope'].split()
+        # Handle problematic expiry formats
+        if 'expiry' in creds_data:
+            expiry_str = creds_data['expiry']
+            if isinstance(expiry_str, str) and ('+00:00' in expiry_str or 'Z' in expiry_str):
+                from datetime import datetime
+                if '+00:00' in expiry_str:
+                    parsed_expiry = datetime.fromisoformat(expiry_str)
+                elif expiry_str.endswith('Z'):
+                    parsed_expiry = datetime.fromisoformat(expiry_str.replace('Z', '+00:00'))
+                else:
+                    parsed_expiry = datetime.fromisoformat(expiry_str)
+                import time
+                timestamp = parsed_expiry.timestamp()
+                creds_data['expiry'] = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%dT%H:%M:%SZ')
+        return Credentials.from_authorized_user_info(creds_data, SCOPES)
+    except Exception as e:
+        logging.error(f"Failed to load credentials from {filepath}: {e}")
+        return None
 
 # --- Global State ---
 credentials = None
@@ -26,23 +124,6 @@ onboarding_complete = False
 credentials_from_env = False  # Track if credentials came from environment variable
 
 security = HTTPBasic()
-
-class _OAuthCallbackHandler(BaseHTTPRequestHandler):
-    auth_code = None
-    def do_GET(self):
-        query_components = parse_qs(urlparse(self.path).query)
-        code = query_components.get("code", [None])[0]
-        if code:
-            _OAuthCallbackHandler.auth_code = code
-            self.send_response(200)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<h1>OAuth authentication successful!</h1><p>You can close this window. Please check the proxy server logs to verify that onboarding completed successfully. No need to restart the proxy.</p>")
-        else:
-            self.send_response(400)
-            self.send_header("Content-type", "text/html")
-            self.end_headers()
-            self.wfile.write(b"<h1>Authentication failed.</h1><p>Please try again.</p>")
 
 def authenticate_user(request: Request):
     """Authenticate the user with multiple methods."""
@@ -365,71 +446,8 @@ def get_credentials(allow_oauth_flow=True):
             logging.error(f"Failed to read credentials file {CREDENTIAL_FILE}: {e}")
             # Fall through to new login only if file is completely unreadable
 
-    # Only start OAuth flow if explicitly allowed
-    if not allow_oauth_flow:
-        logging.info("OAuth flow not allowed - returning None (credentials will be required on first request)")
-        return None
-
-    client_config = {
-        "installed": {
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET,
-            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-            "token_uri": "https://oauth2.googleapis.com/token",
-        }
-    }
-    
-    flow = Flow.from_client_config(
-        client_config,
-        scopes=SCOPES,
-        redirect_uri="http://localhost:8080"
-    )
-    
-    flow.oauth2session.scope = SCOPES
-    
-    auth_url, _ = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes='true'
-    )
-    print(f"\n{'='*80}")
-    print(f"AUTHENTICATION REQUIRED")
-    print(f"{'='*80}")
-    print(f"Please open this URL in your browser to log in:")
-    print(f"{auth_url}")
-    print(f"{'='*80}\n")
-    logging.info(f"Please open this URL in your browser to log in: {auth_url}")
-    
-    server = HTTPServer(("", 8080), _OAuthCallbackHandler)
-    server.handle_request()
-    
-    auth_code = _OAuthCallbackHandler.auth_code
-    if not auth_code:
-        return None
-
-    import oauthlib.oauth2.rfc6749.parameters
-    original_validate = oauthlib.oauth2.rfc6749.parameters.validate_token_parameters
-    
-    def patched_validate(params):
-        try:
-            return original_validate(params)
-        except Warning:
-            pass
-    
-    oauthlib.oauth2.rfc6749.parameters.validate_token_parameters = patched_validate
-    
-    try:
-        flow.fetch_token(code=auth_code)
-        credentials = flow.credentials
-        credentials_from_env = False  # Mark as file-based credentials
-        save_credentials(credentials)
-        logging.info("Authentication successful! Credentials saved.")
-        return credentials
-    except Exception as e:
-        logging.error(f"Authentication failed: {e}")
-        return None
-    finally:
-        oauthlib.oauth2.rfc6749.parameters.validate_token_parameters = original_validate
+    # Remove OAuth flow: if no credentials, just return None
+    return None
 
 def onboard_user(creds, project_id):
     """Ensures the user is onboarded, matching gemini-cli setupUser behavior."""

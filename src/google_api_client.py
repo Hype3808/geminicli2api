@@ -9,7 +9,7 @@ from fastapi import Response
 from fastapi.responses import StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
-from .auth import get_credentials, save_credentials, get_user_project_id, onboard_user
+from .auth import get_credentials, save_credentials, get_user_project_id, onboard_user, list_credential_files, load_credentials_from_file
 from .utils import get_user_agent
 from .config import (
     CODE_ASSIST_ENDPOINT,
@@ -33,82 +33,89 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     Returns:
         FastAPI Response object
     """
-    # Get and validate credentials
-    creds = get_credentials()
-    if not creds:
-        return Response(
-            content="Authentication failed. Please restart the proxy to log in.", 
-            status_code=500
-        )
-    
+    # --- Credential Rotation Logic ---
+    cred_files = list_credential_files()
+    errors = []
+    for cred_path in cred_files:
+        creds = load_credentials_from_file(cred_path)
+        if not creds:
+            errors.append(f"Failed to load credentials from {cred_path}")
+            continue
+        # Refresh credentials if needed
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(GoogleAuthRequest())
+                save_credentials(creds)
+            except Exception as e:
+                errors.append(f"Token refresh failed for {cred_path}: {e}")
+                continue
+        elif not creds.token:
+            errors.append(f"No access token in {cred_path}")
+            continue
 
-    # Refresh credentials if needed
-    if creds.expired and creds.refresh_token:
+        # Get project ID and onboard user
         try:
-            creds.refresh(GoogleAuthRequest())
-            save_credentials(creds)
+            proj_id = get_user_project_id(creds)
+            if not proj_id:
+                errors.append(f"Failed to get user project ID for {cred_path}")
+                continue
+            onboard_user(creds, proj_id)
         except Exception as e:
-            return Response(
-                content="Token refresh failed. Please restart the proxy to re-authenticate.", 
-                status_code=500
-            )
-    elif not creds.token:
-        return Response(
-            content="No access token. Please restart the proxy to re-authenticate.", 
-            status_code=500
-        )
+            errors.append(f"Onboarding failed for {cred_path}: {e}")
+            continue
 
-    # Get project ID and onboard user
-    proj_id = get_user_project_id(creds)
-    if not proj_id:
-        return Response(content="Failed to get user project ID.", status_code=500)
-    
-    onboard_user(creds, proj_id)
+        # Build the final payload with project info
+        final_payload = {
+            "model": payload.get("model"),
+            "project": proj_id,
+            "request": payload.get("request", {})
+        }
 
-    # Build the final payload with project info
-    final_payload = {
-        "model": payload.get("model"),
-        "project": proj_id,
-        "request": payload.get("request", {})
-    }
-
-    # Determine the action and URL
-    action = "streamGenerateContent" if is_streaming else "generateContent"
-    target_url = f"{CODE_ASSIST_ENDPOINT}/v1internal:{action}"
-    if is_streaming:
-        target_url += "?alt=sse"
-
-    # Build request headers
-    request_headers = {
-        "Authorization": f"Bearer {creds.token}",
-        "Content-Type": "application/json",
-        "User-Agent": get_user_agent(),
-    }
-
-    final_post_data = json.dumps(final_payload)
-
-    # Send the request
-    try:
+        # Determine the action and URL
+        action = "streamGenerateContent" if is_streaming else "generateContent"
+        target_url = f"{CODE_ASSIST_ENDPOINT}/v1internal:{action}"
         if is_streaming:
-            resp = requests.post(target_url, data=final_post_data, headers=request_headers, stream=True)
+            target_url += "?alt=sse"
+
+        # Build request headers
+        request_headers = {
+            "Authorization": f"Bearer {creds.token}",
+            "Content-Type": "application/json",
+            "User-Agent": get_user_agent(),
+        }
+
+        final_post_data = json.dumps(final_payload)
+
+        try:
+            if is_streaming:
+                resp = requests.post(target_url, data=final_post_data, headers=request_headers, stream=True)
+            else:
+                resp = requests.post(target_url, data=final_post_data, headers=request_headers)
+        except requests.exceptions.RequestException as e:
+            errors.append(f"Request to Google API failed for {cred_path}: {e}")
+            continue
+        except Exception as e:
+            errors.append(f"Unexpected error during Google API request for {cred_path}: {e}")
+            continue
+
+        # If 429, try next credential
+        if resp.status_code == 429:
+            errors.append(f"Credential {cred_path} received 429 Too Many Requests.")
+            continue
+
+        # If success or other error, return response
+        if is_streaming:
             return _handle_streaming_response(resp)
         else:
-            resp = requests.post(target_url, data=final_post_data, headers=request_headers)
             return _handle_non_streaming_response(resp)
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Request to Google API failed: {str(e)}")
-        return Response(
-            content=json.dumps({"error": {"message": f"Request failed: {str(e)}"}}),
-            status_code=500,
-            media_type="application/json"
-        )
-    except Exception as e:
-        logging.error(f"Unexpected error during Google API request: {str(e)}")
-        return Response(
-            content=json.dumps({"error": {"message": f"Unexpected error: {str(e)}"}}),
-            status_code=500,
-            media_type="application/json"
-        )
+
+    # If all credentials failed
+    error_message = "All credentials failed.\n" + "\n".join(errors)
+    return Response(
+        content=json.dumps({"error": {"message": error_message}}),
+        status_code=500,
+        media_type="application/json"
+    )
 
 
 def _handle_streaming_response(resp) -> StreamingResponse:

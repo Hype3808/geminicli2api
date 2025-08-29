@@ -1,3 +1,4 @@
+> Originated from [gzzhongqi/geminicli2api](https://github.com/gzzhongqi/geminicli2api)
 ---
 title: Gemini CLI to API Proxy
 emoji: 🤖
@@ -200,5 +201,6 @@ The proxy automatically creates variants for `gemini-2.5-pro` and `gemini-2.5-fl
 MIT License - see LICENSE file for details.
 
 ## 🤝 Contributing
+
 
 Contributions are welcome! Please feel free to submit a Pull Request.

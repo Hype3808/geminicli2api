@@ -38,7 +38,7 @@ async def openai_chat_completions(
         logging.info(f"OpenAI chat completion request: model={request.model}, stream={request.stream}")
         
         # Transform OpenAI request to Gemini format
-        gemini_request_data = openai_request_to_gemini(request)
+        gemini_request_data = await openai_request_to_gemini(request)
         
         # Build the payload for Google API
         gemini_payload = build_gemini_payload_from_openai(gemini_request_data)
@@ -61,26 +61,19 @@ async def openai_chat_completions(
         # Handle streaming response
         async def openai_stream_generator():
             try:
-                response = send_gemini_request(gemini_payload, is_streaming=True)
-                
+                response = await send_gemini_request(gemini_payload, is_streaming=True)
                 if isinstance(response, StreamingResponse):
                     response_id = "chatcmpl-" + str(uuid.uuid4())
                     logging.info(f"Starting streaming response: {response_id}")
-                    
                     async for chunk in response.body_iterator:
-                        if isinstance(chunk, bytes):
-                            chunk = chunk.decode('utf-8', "ignore")
-                        
-                        if chunk.startswith('data: '):
+                        if isinstance(chunk, (bytes, memoryview)):
+                            chunk = bytes(chunk).decode('utf-8', "ignore")
+                        if isinstance(chunk, str) and chunk.startswith('data: '):
                             try:
-                                # Parse the Gemini streaming chunk
-                                chunk_data = chunk[6:]  # Remove 'data: ' prefix
+                                chunk_data = chunk[6:]
                                 gemini_chunk = json.loads(chunk_data)
-                                
-                                # Check if this is an error chunk
                                 if "error" in gemini_chunk:
                                     logging.error(f"Error in streaming response: {gemini_chunk['error']}")
-                                    # Transform error to OpenAI format
                                     error_data = {
                                         "error": {
                                             "message": gemini_chunk["error"].get("message", "Unknown error"),
@@ -91,37 +84,26 @@ async def openai_chat_completions(
                                     yield f"data: {json.dumps(error_data)}\n\n"
                                     yield "data: [DONE]\n\n"
                                     return
-                                
-                                # Transform to OpenAI format
                                 openai_chunk = gemini_stream_chunk_to_openai(
                                     gemini_chunk,
                                     request.model,
                                     response_id
                                 )
-                                
-                                # Send as OpenAI streaming format
                                 yield f"data: {json.dumps(openai_chunk)}\n\n"
                                 await asyncio.sleep(0)
-                                
                             except (json.JSONDecodeError, KeyError, UnicodeDecodeError) as e:
                                 logging.warning(f"Failed to parse streaming chunk: {str(e)}")
                                 continue
-                    
-                    # Send the final [DONE] marker
                     yield "data: [DONE]\n\n"
                     logging.info(f"Completed streaming response: {response_id}")
                 else:
-                    # Error case - handle Response object with error
                     error_msg = "Streaming request failed"
                     status_code = 500
-                    
                     if hasattr(response, 'status_code'):
                         status_code = response.status_code
                         error_msg += f" (status: {status_code})"
-                    
                     if hasattr(response, 'body'):
                         try:
-                            # Try to parse error response
                             error_body = response.body
                             if isinstance(error_body, bytes):
                                 error_body = error_body.decode('utf-8', "ignore")
@@ -130,7 +112,6 @@ async def openai_chat_completions(
                                 error_msg = error_data["error"].get("message", error_msg)
                         except:
                             pass
-                    
                     logging.error(f"Streaming request failed: {error_msg}")
                     error_data = {
                         "error": {
@@ -152,7 +133,6 @@ async def openai_chat_completions(
                 }
                 yield f"data: {json.dumps(error_data)}\n\n"
                 yield "data: [DONE]\n\n"
-
         return StreamingResponse(
             openai_stream_generator(), 
             media_type="text/event-stream"
@@ -161,7 +141,7 @@ async def openai_chat_completions(
     else:
         # Handle non-streaming response
         try:
-            response = send_gemini_request(gemini_payload, is_streaming=False)
+            response = await send_gemini_request(gemini_payload, is_streaming=False)
             
             if isinstance(response, Response) and response.status_code != 200:
                 # Handle error responses from Google API
@@ -207,7 +187,7 @@ async def openai_chat_completions(
             try:
                 # Parse Gemini response and transform to OpenAI format
                 gemini_response = json.loads(response.body)
-                openai_response = gemini_response_to_openai(gemini_response, request.model)
+                openai_response = await gemini_response_to_openai(gemini_response, request.model)
                 
                 logging.info(f"Successfully processed non-streaming response for model: {request.model}")
                 return openai_response

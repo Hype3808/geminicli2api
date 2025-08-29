@@ -4,12 +4,16 @@ This module is used by both OpenAI compatibility layer and native Gemini endpoin
 """
 import json
 import logging
-import requests
+import aiohttp
 from fastapi import Response
 from fastapi.responses import StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
 
-from .auth import get_credentials, save_credentials, get_user_project_id, onboard_user, list_credential_files, load_credentials_from_file
+from .auth import (
+    get_credentials, save_credentials, get_user_project_id, onboard_user,
+    list_credential_files, load_credentials_from_file,
+    set_credential_cooldown, is_credential_in_cooldown
+)
 from .utils import get_user_agent
 from .config import (
     CODE_ASSIST_ENDPOINT,
@@ -22,7 +26,7 @@ from .config import (
 import asyncio
 
 
-def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
+async def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     """
     Send a request to Google's Gemini API.
     
@@ -34,10 +38,17 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
         FastAPI Response object
     """
     # --- Credential Rotation Logic ---
-    cred_files = list_credential_files()
+    import random
+    cred_files = await list_credential_files()
+    random.shuffle(cred_files)  # Randomize credential order for each batch
     errors = []
+    from .auth import reset_credential_cooldown
     for cred_path in cred_files:
-        creds = load_credentials_from_file(cred_path)
+        # --- Cooldown check ---
+        if is_credential_in_cooldown(cred_path):
+            errors.append(f"Credential {cred_path} is in cooldown.")
+            continue
+        creds = await load_credentials_from_file(cred_path)
         if not creds:
             errors.append(f"Failed to load credentials from {cred_path}")
             continue
@@ -45,7 +56,7 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
         if creds.expired and creds.refresh_token:
             try:
                 creds.refresh(GoogleAuthRequest())
-                save_credentials(creds)
+                await save_credentials(creds)
             except Exception as e:
                 errors.append(f"Token refresh failed for {cred_path}: {e}")
                 continue
@@ -55,11 +66,11 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
 
         # Get project ID and onboard user
         try:
-            proj_id = get_user_project_id(creds)
+            proj_id = await get_user_project_id(creds)
             if not proj_id:
                 errors.append(f"Failed to get user project ID for {cred_path}")
                 continue
-            onboard_user(creds, proj_id)
+            await onboard_user(creds, proj_id)
         except Exception as e:
             errors.append(f"Onboarding failed for {cred_path}: {e}")
             continue
@@ -81,33 +92,35 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
         request_headers = {
             "Authorization": f"Bearer {creds.token}",
             "Content-Type": "application/json",
-            "User-Agent": get_user_agent(),
+            "User-Agent": await get_user_agent(),
         }
 
         final_post_data = json.dumps(final_payload)
 
         try:
-            if is_streaming:
-                resp = requests.post(target_url, data=final_post_data, headers=request_headers, stream=True)
-            else:
-                resp = requests.post(target_url, data=final_post_data, headers=request_headers)
-        except requests.exceptions.RequestException as e:
+            async with aiohttp.ClientSession() as session:
+                if is_streaming:
+                    async with session.post(target_url, data=final_post_data, headers=request_headers) as resp:
+                        if resp.status == 429:
+                            set_credential_cooldown(cred_path)
+                            errors.append(f"Credential {cred_path} received 429 Too Many Requests. Cooldown (exponential backoff applied).")
+                            continue
+                        reset_credential_cooldown(cred_path)
+                        return await _handle_streaming_response(resp)
+                else:
+                    async with session.post(target_url, data=final_post_data, headers=request_headers) as resp:
+                        if resp.status == 429:
+                            set_credential_cooldown(cred_path)
+                            errors.append(f"Credential {cred_path} received 429 Too Many Requests. Cooldown (exponential backoff applied).")
+                            continue
+                        reset_credential_cooldown(cred_path)
+                        return await _handle_non_streaming_response(resp)
+        except aiohttp.ClientError as e:
             errors.append(f"Request to Google API failed for {cred_path}: {e}")
             continue
         except Exception as e:
             errors.append(f"Unexpected error during Google API request for {cred_path}: {e}")
             continue
-
-        # If 429, try next credential
-        if resp.status_code == 429:
-            errors.append(f"Credential {cred_path} received 429 Too Many Requests.")
-            continue
-
-        # If success or other error, return response
-        if is_streaming:
-            return _handle_streaming_response(resp)
-        else:
-            return _handle_non_streaming_response(resp)
 
     # If all credentials failed
     error_message = "All credentials failed.\n" + "\n".join(errors)
@@ -118,31 +131,26 @@ def send_gemini_request(payload: dict, is_streaming: bool = False) -> Response:
     )
 
 
-def _handle_streaming_response(resp) -> StreamingResponse:
+async def _handle_streaming_response(resp) -> StreamingResponse:
     """Handle streaming response from Google API."""
-    
-    # Check for HTTP errors before starting to stream
-    if resp.status_code != 200:
-        logging.error(f"Google API returned status {resp.status_code}: {resp.text}")
-        error_message = f"Google API error: {resp.status_code}"
+    if resp.status != 200:
+        logging.error(f"Google API returned status {resp.status}: {await resp.text()}")
+        error_message = f"Google API error: {resp.status}"
         try:
-            error_data = resp.json()
+            error_data = await resp.json()
             if "error" in error_data:
                 error_message = error_data["error"].get("message", error_message)
         except:
             pass
-        
-        # Return error as a streaming response
         async def error_generator():
             error_response = {
                 "error": {
                     "message": error_message,
-                    "type": "invalid_request_error" if resp.status_code == 404 else "api_error",
-                    "code": resp.status_code
+                    "type": "invalid_request_error" if resp.status == 404 else "api_error",
+                    "code": resp.status
                 }
             }
             yield f'data: {json.dumps(error_response)}\n\n'.encode('utf-8')
-        
         response_headers = {
             "Content-Type": "text/event-stream",
             "Content-Disposition": "attachment",
@@ -152,41 +160,32 @@ def _handle_streaming_response(resp) -> StreamingResponse:
             "X-Content-Type-Options": "nosniff",
             "Server": "ESF"
         }
-        
         return StreamingResponse(
             error_generator(),
             media_type="text/event-stream",
             headers=response_headers,
-            status_code=resp.status_code
+            status_code=resp.status
         )
-    
     async def stream_generator():
         try:
-            with resp:
-                for chunk in resp.iter_lines():
-                    if chunk:
-                        if not isinstance(chunk, str):
-                            chunk = chunk.decode('utf-8', "ignore")
-                            
-                        if chunk.startswith('data: '):
-                            chunk = chunk[len('data: '):]
-                            
-                            try:
-                                obj = json.loads(chunk)
-                                
-                                if "response" in obj:
-                                    response_chunk = obj["response"]
-                                    response_json = json.dumps(response_chunk, separators=(',', ':'))
-                                    response_line = f"data: {response_json}\n\n"
-                                    yield response_line.encode('utf-8', "ignore")
-                                    await asyncio.sleep(0)
-                                else:
-                                    obj_json = json.dumps(obj, separators=(',', ':'))
-                                    yield f"data: {obj_json}\n\n".encode('utf-8', "ignore")
-                            except json.JSONDecodeError:
-                                continue
-                
-        except requests.exceptions.RequestException as e:
+            async for line in resp.content:
+                chunk = line.decode('utf-8', "ignore")
+                if chunk.startswith('data: '):
+                    chunk = chunk[len('data: '):]
+                    try:
+                        obj = json.loads(chunk)
+                        if "response" in obj:
+                            response_chunk = obj["response"]
+                            response_json = json.dumps(response_chunk, separators=(',', ':'))
+                            response_line = f"data: {response_json}\n\n"
+                            yield response_line.encode('utf-8', "ignore")
+                            await asyncio.sleep(0)
+                        else:
+                            obj_json = json.dumps(obj, separators=(',', ':'))
+                            yield f"data: {obj_json}\n\n".encode('utf-8', "ignore")
+                    except json.JSONDecodeError:
+                        continue
+        except aiohttp.ClientError as e:
             logging.error(f"Streaming request failed: {str(e)}")
             error_response = {
                 "error": {
@@ -206,7 +205,6 @@ def _handle_streaming_response(resp) -> StreamingResponse:
                 }
             }
             yield f'data: {json.dumps(error_response)}\n\n'.encode('utf-8', "ignore")
-
     response_headers = {
         "Content-Type": "text/event-stream",
         "Content-Disposition": "attachment",
@@ -216,7 +214,6 @@ def _handle_streaming_response(resp) -> StreamingResponse:
         "X-Content-Type-Options": "nosniff",
         "Server": "ESF"
     }
-    
     return StreamingResponse(
         stream_generator(),
         media_type="text/event-stream",
@@ -224,11 +221,11 @@ def _handle_streaming_response(resp) -> StreamingResponse:
     )
 
 
-def _handle_non_streaming_response(resp) -> Response:
+async def _handle_non_streaming_response(resp) -> Response:
     """Handle non-streaming response from Google API."""
-    if resp.status_code == 200:
+    if resp.status == 200:
         try:
-            google_api_response = resp.text
+            google_api_response = await resp.text()
             if google_api_response.startswith('data: '):
                 google_api_response = google_api_response[len('data: '):]
             google_api_response = json.loads(google_api_response)
@@ -241,38 +238,37 @@ def _handle_non_streaming_response(resp) -> Response:
         except (json.JSONDecodeError, AttributeError) as e:
             logging.error(f"Failed to parse Google API response: {str(e)}")
             return Response(
-                content=resp.content,
-                status_code=resp.status_code,
+                content=await resp.read(),
+                status_code=resp.status,
                 media_type=resp.headers.get("Content-Type")
             )
     else:
         # Log the error details
-        logging.error(f"Google API returned status {resp.status_code}: {resp.text}")
-        
+        text = await resp.text()
+        logging.error(f"Google API returned status {resp.status}: {text}")
         # Try to parse error response and provide meaningful error message
         try:
-            error_data = resp.json()
+            error_data = await resp.json()
             if "error" in error_data:
-                error_message = error_data["error"].get("message", f"API error: {resp.status_code}")
+                error_message = error_data["error"].get("message", f"API error: {resp.status}")
                 error_response = {
                     "error": {
                         "message": error_message,
-                        "type": "invalid_request_error" if resp.status_code == 404 else "api_error",
-                        "code": resp.status_code
+                        "type": "invalid_request_error" if resp.status == 404 else "api_error",
+                        "code": resp.status
                     }
                 }
                 return Response(
                     content=json.dumps(error_response),
-                    status_code=resp.status_code,
+                    status_code=resp.status,
                     media_type="application/json"
                 )
         except (json.JSONDecodeError, KeyError):
             pass
-        
         # Fallback to original response if we can't parse the error
         return Response(
-            content=resp.content,
-            status_code=resp.status_code,
+            content=await resp.read(),
+            status_code=resp.status,
             media_type=resp.headers.get("Content-Type")
         )
 

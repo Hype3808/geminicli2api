@@ -5,6 +5,7 @@ without any format transformations.
 """
 import json
 import logging
+from typing import Any, Optional
 from fastapi import APIRouter, Request, Response, Depends
 
 from .auth import authenticate_user
@@ -64,16 +65,11 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
     try:
         # Get the request body
         post_data = await request.body()
-        
         # Determine if this is a streaming request
         is_streaming = "stream" in full_path.lower()
-        
         # Extract model name from the path
-        # Paths typically look like: v1beta/models/gemini-1.5-pro/generateContent
         model_name = _extract_model_from_path(full_path)
-        
         logging.info(f"Gemini proxy request: path={full_path}, model={model_name}, stream={is_streaming}")
-        
         if not model_name:
             logging.error(f"Could not extract model name from path: {full_path}")
             return Response(
@@ -86,7 +82,6 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
                 status_code=400,
                 media_type="application/json"
             )
-        
         # Parse the incoming request
         try:
             if post_data:
@@ -105,22 +100,17 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
                 status_code=400,
                 media_type="application/json"
             )
-        
         # Build the payload for Google API
         gemini_payload = build_gemini_payload_from_native(incoming_request, model_name)
-        
         # Send the request to Google API
-        response = send_gemini_request(gemini_payload, is_streaming=is_streaming)
-        
+        response = await send_gemini_request(gemini_payload, is_streaming=is_streaming)
         # Log the response status
         if hasattr(response, 'status_code'):
             if response.status_code != 200:
                 logging.error(f"Gemini API returned error: status={response.status_code}")
             else:
                 logging.info(f"Successfully processed Gemini request for model: {model_name}")
-        
         return response
-        
     except Exception as e:
         logging.error(f"Gemini proxy error: {str(e)}")
         return Response(
@@ -135,7 +125,7 @@ async def gemini_proxy(request: Request, full_path: str, username: str = Depends
         )
 
 
-def _extract_model_from_path(path: str) -> str:
+def _extract_model_from_path(path: str) -> Optional[str]:
     """
     Extract the model name from a Gemini API path.
     

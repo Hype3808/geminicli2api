@@ -24,7 +24,7 @@ def main():
         import uvicorn
         from src.main import app
         host = os.getenv("HOST", "0.0.0.0")
-        port = int(os.getenv("PORT", "8888"))
+        port = int(os.getenv("PORT", "5000"))
         uvicorn.run(app, host=host, port=port)
     elif choice == '2':
         print("\nEnter a project_id or a list of project_ids (separated by newlines):")
@@ -40,9 +40,8 @@ def main():
         if not project_ids:
             print("No project_id entered. Exiting.")
             sys.exit(1)
-        for pid in project_ids:
-            print(f"\nAuthorizing for project_id: {pid}")
-            authorize_and_save_credentials(pid)
+        project_ids_str = "\n".join(project_ids)
+        authorize_and_save_credentials(project_ids_str)
         print("\nAll credentials saved in 'auth' folder. You can now start the API server.")
     else:
         print("Invalid choice. Exiting.")

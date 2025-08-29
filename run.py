@@ -2,6 +2,8 @@ import os
 import sys
 from src.auth import authorize_and_save_credentials
 
+VERSION = "0.0.1dev"
+
 def has_auth_json():
     auth_dir = os.path.join(os.path.dirname(__file__), 'auth')
     if not os.path.exists(auth_dir):
@@ -12,6 +14,7 @@ def has_auth_json():
     return False
 
 def main():
+    import asyncio
     print("\nWelcome to GeminiCLI2API!")
     print("1. Start API server")
     print("2. Authorize new Google credentials (create .json in 'auth' folder)")
@@ -25,9 +28,15 @@ def main():
         from src.main import app
         host = os.getenv("HOST", "0.0.0.0")
         port = int(os.getenv("PORT", "5000"))
+        print("-"*50)
+        print(f"Version: {VERSION}")
+        print("Server is running at {}".format(host))
+        print("Dashboard: http://{}:{}/".format(host, port))
+        print("API: http://{}:{}/v1/chat/completions".format(host, port))
+        print("-"*50)
         uvicorn.run(app, host=host, port=port)
     elif choice == '2':
-        print("\nEnter a project_id or a list of project_ids (separated by newlines):")
+        print("\nEnter a project id or a list of project ids (separated by newlines):")
         print("Example: my-gcp-project-1\nmy-gcp-project-2\n...")
         print("Press Enter twice to finish input.")
         lines = []
@@ -40,8 +49,8 @@ def main():
         if not project_ids:
             print("No project_id entered. Exiting.")
             sys.exit(1)
-        project_ids_str = "\n".join(project_ids)
-        authorize_and_save_credentials(project_ids_str)
+        # If authorize_and_save_credentials is async, await it
+        authorize_and_save_credentials(project_ids)
         print("\nAll credentials saved in 'auth' folder. You can now start the API server.")
     else:
         print("Invalid choice. Exiting.")

@@ -3,4 +3,9 @@ uvicorn[standard]
 requests
 python-dotenv
 google-auth-oauthlib
+google-auth
+google-api-python-client
+aiofiles
+aiohttp
 pydantic
+python-multipart
